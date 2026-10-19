@@ -7605,6 +7605,43 @@ class Plugin_and_data_dir_option_parser final {
   bool valid_;
 };
 
+
+// [myrocks-hdfs 2026-10-18] MYSQLD_JVM_PRESTART=<libhdfs .so>: create the libhdfs JVM now, on
+// the main thread, before any plugin is dlopen-ed. A storage engine whose static initializer
+// creates the JVM inside dlopen() deadlocks on the dynamic-loader lock (HotSpot's helper threads
+// need dlsym()). Opt-in; nothing changes when the variable is unset. Also reads
+// MYSQLD_JVM_PRESTART_NN / MYSQLD_JVM_PRESTART_PORT (name node, default "default" / builder default).
+#include <dlfcn.h>
+static void jvm_prestart_for_plugins() {
+  const char *lib = getenv("MYSQLD_JVM_PRESTART");
+  if (lib == nullptr || *lib == '\0') return;
+  const char *nn = getenv("MYSQLD_JVM_PRESTART_NN");
+  const char *ps = getenv("MYSQLD_JVM_PRESTART_PORT");
+  void *h = dlopen(lib, RTLD_NOW | RTLD_GLOBAL);
+  if (h == nullptr) {
+    fprintf(stderr, "[jvm-prestart] dlopen(%s) failed: %s\n", lib, dlerror());
+    return;
+  }
+  using new_builder_t = void *(*)();
+  using set_nn_t = void (*)(void *, const char *);
+  using set_port_t = void (*)(void *, uint16_t);
+  using connect_t = void *(*)(void *);
+  auto nb = reinterpret_cast<new_builder_t>(dlsym(h, "hdfsNewBuilder"));
+  auto snn = reinterpret_cast<set_nn_t>(dlsym(h, "hdfsBuilderSetNameNode"));
+  auto sp = reinterpret_cast<set_port_t>(dlsym(h, "hdfsBuilderSetNameNodePort"));
+  auto cn = reinterpret_cast<connect_t>(dlsym(h, "hdfsBuilderConnect"));
+  if (nb == nullptr || snn == nullptr || sp == nullptr || cn == nullptr) {
+    fprintf(stderr, "[jvm-prestart] %s lacks the hdfsBuilder API\n", lib);
+    return;
+  }
+  void *b = nb();
+  snn(b, (nn != nullptr && *nn != '\0') ? nn : "default");
+  if (ps != nullptr && *ps != '\0') sp(b, static_cast<uint16_t>(atoi(ps)));
+  void *fs = cn(b);  // creates the JVM on this thread; the handle lives as long as the process
+  fprintf(stderr, "[jvm-prestart] %s nn=%s port=%s -> %s\n", lib, nn ? nn : "default",
+          ps ? ps : "-", fs != nullptr ? "connected, JVM up" : "connect FAILED (continuing)");
+}
+
 #ifdef _WIN32
 int win_main(int argc, char **argv)
 #else
@@ -8217,6 +8254,7 @@ int mysqld_main(int argc, char **argv)
   /* Determine default TCP port and unix socket name */
   set_ports();
 
+  jvm_prestart_for_plugins();  // [myrocks-hdfs] before plugin dlopen, see the function
   if (init_server_components()) unireg_abort(MYSQLD_ABORT_EXIT);
 
   if (!server_id_supplied)
