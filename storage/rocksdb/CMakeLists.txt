@@ -342,6 +342,13 @@ IF(NOT CMAKE_SYSTEM_NAME MATCHES "Darwin")
   SET(rocksdb_static_libs ${rocksdb_static_libs} "-lrt")
 ENDIF()
 
+# [external RocksDB 2026-10-18] with HAVE_EXTERNAL_ROCKSDB the engine is linked from
+# ROCKSDB_LIB_PATH and ROCKSDB_LIB_SOURCES is empty; CMake refuses a target without
+# sources, so rocksdb_sources gets one empty translation unit.
+IF(HAVE_EXTERNAL_ROCKSDB AND NOT ROCKSDB_LIB_SOURCES AND NOT PLUGIN_SOURCES)
+  FILE(WRITE ${CMAKE_CURRENT_BINARY_DIR}/external_rocksdb_dummy.cc "// RocksDB comes from ROCKSDB_LIB_PATH\n")
+  SET(ROCKSDB_LIB_SOURCES ${CMAKE_CURRENT_BINARY_DIR}/external_rocksdb_dummy.cc)
+ENDIF()
 ADD_LIBRARY(rocksdb_sources ${ROCKSDB_LIB_SOURCES} ${PLUGIN_SOURCES})
 TARGET_LINK_LIBRARIES(rocksdb_sources ${rocksdb_static_libs})
 
