@@ -1,7 +1,8 @@
-/* storage/rocksdb/migagent_api.h -- [migagent 2026-10-20] VERBATIM copy of migagent/migagent.h from the exp repo
- * (sg20180546/migration_mechansim_exp, branch migagent-1020): the C ABI of libmigagent.so, which the MyRocks glue
- * (rdb_migagent.cc) dlopens at plugin init when rocksdb_migagent_port > 0. Keep the two files in sync; the
- * MIGAGENT_ABI_VERSION check at start() guards drift. Keep this file C.
+/* migagent/migagent.h -- [migagent 2026-10-20] C ABI of libmigagent.so: the KV server's migration code
+ * (serverclient/server_main.cc compiled with -DMIGAGENT_LIB) running inside a host process such as mysqld
+ * (MyRocks). The host opens the DB, injects it here, and serves the coordinator's / peer agent's wire ops
+ * on listen_addr:listen_port exactly as serverclient does. Keep this file C: the MyRocks glue carries a
+ * verbatim copy (storage/rocksdb/migagent_api.h); MIGAGENT_ABI_VERSION guards drift.
  */
 #ifndef MIGAGENT_H
 #define MIGAGENT_H

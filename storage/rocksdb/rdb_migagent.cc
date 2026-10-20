@@ -34,7 +34,7 @@ namespace {
 
 struct Rdb_migagent_state {
   void *lib = nullptr;
-  migagent_handle *handle = nullptr;
+  std::atomic<migagent_handle *> handle{nullptr};
   int (*start)(const migagent_options *, migagent_handle **) = nullptr;
   void (*stop)(migagent_handle *) = nullptr;
   int (*decide)(migagent_handle *, const char *, size_t) = nullptr;
@@ -51,10 +51,11 @@ Rdb_migagent_state g_state;
 std::atomic<bool> g_active{false};
 
 void host_log(int level, const std::string &msg) {
+  const std::string line = "[migagent] " + msg;   // the library's own lines already carry their tag
   if (g_state.host_log != nullptr) {
-    g_state.host_log(level, msg.c_str());
+    g_state.host_log(level, line.c_str());
   } else {
-    fprintf(stderr, "[migagent] %s\n", msg.c_str());
+    fprintf(stderr, "%s\n", line.c_str());
   }
 }
 
@@ -138,9 +139,11 @@ bool rdb_migagent_start(const Rdb_migagent_params &p) {
   o.listen_port = static_cast<int>(p.port);
   o.shard_id = static_cast<int>(p.shard_id);
   // Empty log path = route the agent's lines through the host logger (the
-  // mysqld error log); a path = the agent writes its own file.
+  // mysqld error log); a path = the agent writes its own file. The library
+  // gives the callback precedence over log_path, so pass the callback only
+  // when no file is wanted (the glue's own messages always use the host log).
   o.log_path = g_state.log_path.empty() ? nullptr : g_state.log_path.c_str();
-  o.log = (p.log != nullptr) ? &log_trampoline : nullptr;
+  o.log = (p.log != nullptr && g_state.log_path.empty()) ? &log_trampoline : nullptr;
   o.on_pause = nullptr;
   o.on_resume = nullptr;
   o.on_ownership = nullptr;
@@ -153,27 +156,30 @@ bool rdb_migagent_start(const Rdb_migagent_params &p) {
                     ") failed: rc=" + std::to_string(rc));
     return false;
   }
-  g_state.handle = h;
+  g_state.handle.store(h, std::memory_order_release);
   g_active.store(true, std::memory_order_release);
   return true;
 }
 
 void rdb_migagent_stop() {
-  // Clear the fast-path flag FIRST so new compaction-filter calls stop asking;
-  // migagent_stop then joins the agent's threads. The agent keeps its handle
-  // alive for the process lifetime (a late migagent_key_decision after stop
-  // answers "keep"), so a filter call racing this stop is safe.
+  // Clear the fast-path flag FIRST so new compaction-filter calls stop asking,
+  // then detach the handle (a filter call that already passed the flag sees a
+  // null handle and answers "keep"), then let migagent_stop join the agent's
+  // threads and free the handle. migagent_key_decision only null-checks its
+  // handle and reads process-wide ownership state that outlives stop.
   if (!g_active.exchange(false, std::memory_order_acq_rel)) return;
-  if (g_state.stop != nullptr && g_state.handle != nullptr) {
-    g_state.stop(g_state.handle);
+  migagent_handle *h = g_state.handle.exchange(nullptr, std::memory_order_acq_rel);
+  if (g_state.stop != nullptr && h != nullptr) {
+    g_state.stop(h);
   }
-  g_state.handle = nullptr;
   // no dlclose: keep the library mapped (threads unwinding, stable strings)
 }
 
 bool rdb_migagent_should_drop(const rocksdb::Slice &key) {
   if (!g_active.load(std::memory_order_acquire)) return false;
-  return g_state.decide(g_state.handle, key.data(), key.size()) != 0;
+  migagent_handle *h = g_state.handle.load(std::memory_order_acquire);
+  if (h == nullptr) return false;
+  return g_state.decide(h, key.data(), key.size()) != 0;
 }
 
 const char *rdb_migagent_version() {

@@ -2360,7 +2360,7 @@ static MYSQL_SYSVAR_STR(migagent_log, rocksdb_migagent_log,
 static void rdb_migagent_log_cb(int level, const char *msg) {
   LogPluginErrMsg(level >= 2 ? ERROR_LEVEL
                              : (level == 1 ? WARNING_LEVEL : INFORMATION_LEVEL),
-                  0, "[migagent] %s", msg);
+                  0, "%s", msg);   // the agent's and the glue's lines carry their own [migagent] tag
 }
 
 static MYSQL_SYSVAR_UINT(
