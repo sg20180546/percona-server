@@ -311,6 +311,7 @@ SET(ROCKSDB_SE_SOURCES
   rdb_iterator.cc rdb_iterator.h
   rdb_sst_partitioner_factory.h
   rdb_cf_options.cc rdb_cf_options.h
+  rdb_migagent.cc rdb_migagent.h migagent_api.h
   rdb_cf_manager.cc rdb_cf_manager.h
   rdb_converter.cc rdb_converter.h
   properties_collector.cc properties_collector.h

@@ -89,6 +89,7 @@
 #include "./rdb_cf_manager.h"
 #include "./rdb_cf_options.h"
 #include "./rdb_converter.h"
+#include "./rdb_migagent.h"  // [migagent 2026-10-20] in-process migration agent (libmigagent.so)
 #include "./rdb_datadic.h"
 #include "./rdb_i_s.h"
 #include "./rdb_index_merge.h"
@@ -2318,6 +2319,50 @@ static MYSQL_SYSVAR_STR(fs_uri, rocksdb_fs_uri,
                         PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_READONLY,
                         "Custom filesystem URI", nullptr, nullptr, nullptr);
 
+// [migagent 2026-10-20] In-process shard-migration agent (rdb_migagent.cc):
+// mysqld dlopen()s libmigagent.so after the DB is open and the agent serves
+// the migration coordinator's wire protocol on migagent_addr:migagent_port.
+// Everything is off (nothing loaded, no listener, compaction filter untouched)
+// unless rocksdb_migagent_port > 0.
+static unsigned int rocksdb_migagent_port = 0;
+static char *rocksdb_migagent_lib = nullptr;
+static char *rocksdb_migagent_addr = nullptr;
+static unsigned int rocksdb_migagent_shard_id = 0;
+static char *rocksdb_migagent_log = nullptr;
+
+static MYSQL_SYSVAR_UINT(migagent_port, rocksdb_migagent_port,
+                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                         "Port of the in-process migration agent (0 = disabled)",
+                         nullptr, nullptr, 0, 0, 65535, 0);
+
+static MYSQL_SYSVAR_STR(migagent_lib, rocksdb_migagent_lib,
+                        PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                        "Path of libmigagent.so", nullptr, nullptr, "");
+
+static MYSQL_SYSVAR_STR(migagent_addr, rocksdb_migagent_addr,
+                        PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                        "Listen address of the migration agent", nullptr,
+                        nullptr, "0.0.0.0");
+
+static MYSQL_SYSVAR_UINT(migagent_shard_id, rocksdb_migagent_shard_id,
+                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                         "Logical shard id of this node as the migration "
+                         "coordinator numbers it",
+                         nullptr, nullptr, 0, 0, 65535, 0);
+
+static MYSQL_SYSVAR_STR(migagent_log, rocksdb_migagent_log,
+                        PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                        "Agent log file (empty = mysqld error log)", nullptr,
+                        nullptr, "");
+
+// [migagent 2026-10-20] host logger handed to the agent: its 0/1/2 levels onto
+// the plugin error log.
+static void rdb_migagent_log_cb(int level, const char *msg) {
+  LogPluginErrMsg(level >= 2 ? ERROR_LEVEL
+                             : (level == 1 ? WARNING_LEVEL : INFORMATION_LEVEL),
+                  0, "[migagent] %s", msg);
+}
+
 static MYSQL_SYSVAR_UINT(
     table_stats_sampling_pct, rocksdb_table_stats_sampling_pct,
     PLUGIN_VAR_RQCMDARG,
@@ -2679,6 +2724,11 @@ static struct SYS_VAR *rocksdb_system_variables[] = {
     MYSQL_SYSVAR(print_snapshot_conflict_queries),
 
     MYSQL_SYSVAR(datadir),
+    MYSQL_SYSVAR(migagent_port),  // [migagent 2026-10-20]
+    MYSQL_SYSVAR(migagent_lib),
+    MYSQL_SYSVAR(migagent_addr),
+    MYSQL_SYSVAR(migagent_shard_id),
+    MYSQL_SYSVAR(migagent_log),
     MYSQL_SYSVAR(fs_uri),
     MYSQL_SYSVAR(create_checkpoint),
     MYSQL_SYSVAR(create_temporary_checkpoint),
@@ -6789,6 +6839,30 @@ static int rocksdb_init_internal(void *const p) {
   rocksdb_set_max_bottom_pri_background_compactions_internal(
       rocksdb_max_bottom_pri_background_compactions);
 
+  // [migagent 2026-10-20] in-process migration agent (rocksdb_migagent_port >
+  // 0): dlopen libmigagent.so and start it with the open TransactionDB and the
+  // default (data) column family; "__system__" is never handed over. A start
+  // failure fails the plugin init so a misconfigured CN never serves without
+  // its agent. Port 0 (default): rdb_migagent_start is a no-op returning true.
+  {
+    const Rdb_migagent_params migagent_params = {
+        static_cast<rocksdb::DB *>(rdb), rdb->DefaultColumnFamily(),
+        rocksdb_datadir,                 rocksdb_migagent_port,
+        rocksdb_migagent_lib,            rocksdb_migagent_addr,
+        rocksdb_migagent_shard_id,       rocksdb_migagent_log,
+        &rdb_migagent_log_cb};
+    if (!rdb_migagent_start(migagent_params)) {
+      LogPluginErrMsg(ERROR_LEVEL, 0, "migration agent failed to start");
+      DBUG_RETURN(HA_EXIT_FAILURE);
+    }
+    if (rocksdb_migagent_port > 0) {
+      LogPluginErrMsg(INFORMATION_LEVEL, 0,
+                      "migration agent %s listening on %s:%u (shard %u)",
+                      rdb_migagent_version(), rocksdb_migagent_addr,
+                      rocksdb_migagent_port, rocksdb_migagent_shard_id);
+    }
+  }
+
   DBUG_EXECUTE_IF("rocksdb_init_failure_everything_initialized",
                   { DBUG_RETURN(HA_EXIT_FAILURE); });
 
@@ -6811,6 +6885,10 @@ static int rocksdb_shutdown(bool minimalShutdown) {
   Rdb_hton_init_state::Scoped_lock state_lock(*rdb_get_hton_init_state(), true);
 
   if (!minimalShutdown) {
+    // [migagent 2026-10-20] stop the migration agent FIRST: its listener and
+    // in-flight migrations hold the DB, which everything below tears down.
+    rdb_migagent_stop();
+
     // signal the drop index thread to stop
     rdb_drop_idx_thread.signal(true);
 
