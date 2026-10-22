@@ -69,6 +69,11 @@ bool rdb_migagent_should_drop(const rocksdb::Slice &key);
 // The loaded library's migagent_version() string, "" when not running.
 const char *rdb_migagent_version();
 
+// [migagent 2026-10-21] true while the agent runs (one acquire load). Rdb_sst_partitioner_factory uses it to cut
+// compaction outputs at every index id: relink hands off whole L1+ files and aborts on one that straddles the moved
+// range, and once writes are compacted (CAB Q23 commit) an uncut output file can span tenants.
+bool rdb_migagent_active();
+
 // [migagent fence 2026-10-21] Commit-time write fence (CAB with Q23=commit; MIGAGENT.md section 6, "must implement before
 // any write workload"). The agent does not see SQL, so the fence lives here and the agent only reports its state through
 // the ABI hooks that were unused until now:

@@ -400,6 +400,8 @@ bool Rdb_migagent_commit_gate::refused(const rocksdb::WriteBatch &wb) {
   return true;
 }
 
+bool rdb_migagent_active() { return g_active.load(std::memory_order_acquire); }
+
 const char *rdb_migagent_version() {
   return g_active.load(std::memory_order_acquire) ? g_state.version_str.c_str()
                                                   : "";

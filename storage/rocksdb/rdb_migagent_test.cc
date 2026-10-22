@@ -229,7 +229,9 @@ int main(int argc, char** argv) {
   // 6h. agent stopped: the gate is inert; a restart starts with no fence
   CHECK(fire_own(lo.data(), lo.size(), hi.data(), hi.size(), 0) == 1);
   CHECK(refused(in5));
+  CHECK(myrocks::rdb_migagent_active());   // drives the index-aligned SST partitioner
   myrocks::rdb_migagent_stop();
+  CHECK(!myrocks::rdb_migagent_active());
   CHECK(!refused(in5));
   CHECK(myrocks::rdb_migagent_start(good));
   CHECK(!refused(in5));
