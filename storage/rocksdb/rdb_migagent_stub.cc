@@ -27,7 +27,9 @@ extern "C" int migagent_key_decision(migagent_handle* h, const char* key, size_t
   return (h != nullptr && h->started && len > 0 && key[0] == 'd') ? 1 : 0;
 }
 extern "C" const char* migagent_version(void) { return "migagent stub 1.0"; }
-// test-only entry points: fire the host hooks with the options the host passed at start
+// test-only entry points: what the host passed at the last start, and the hooks fired with those options
+extern "C" const char* stub_last_log_path(void) { return g_stub_opts.log_path ? g_stub_opts.log_path : ""; }
+extern "C" int stub_last_has_log_callback(void) { return g_stub_opts.log != nullptr ? 1 : 0; }
 extern "C" int stub_fire_pause(const char* lo, size_t lo_len, const char* hi, size_t hi_len) {
   if (g_stub_opts.on_pause == nullptr) return 0;
   g_stub_opts.on_pause(g_stub_opts.user, lo, lo_len, hi, hi_len); return 1;

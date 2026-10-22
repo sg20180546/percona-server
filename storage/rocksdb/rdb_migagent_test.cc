@@ -115,8 +115,16 @@ int main(int argc, char** argv) {
   Rdb_migagent_params again = {&fake_db, &fake_cf, "/tmp/sql", 7901, argv[1], "0.0.0.0", 0, "/tmp/agent.log",
                                &test_log};
   CHECK(myrocks::rdb_migagent_start(again));
-  CHECK(g_log.find("stub agent on 0.0.0.0:7901 shard=0 db_dir=/tmp/sql log_path=/tmp/agent.log") !=
-        std::string::npos);
+  {   // a390ca4: with a log file the glue passes no callback (the library would prefer it over the file)
+    void* stub0 = dlopen(argv[1], RTLD_NOW | RTLD_NOLOAD);
+    CHECK(stub0 != nullptr);
+    auto log_path = reinterpret_cast<const char* (*)()>(dlsym(stub0, "stub_last_log_path"));
+    auto has_cb = reinterpret_cast<int (*)()>(dlsym(stub0, "stub_last_has_log_callback"));
+    CHECK(log_path != nullptr && has_cb != nullptr);
+    CHECK(std::string(log_path()) == "/tmp/agent.log");
+    CHECK(has_cb() == 0);
+    CHECK(g_log.find("stub agent on 0.0.0.0:7901") == std::string::npos);   // nothing reached the host logger
+  }
   CHECK(myrocks::rdb_migagent_should_drop(rocksdb::Slice("dd")));
   myrocks::rdb_migagent_stop();
 
