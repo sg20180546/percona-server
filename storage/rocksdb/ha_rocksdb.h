@@ -1193,6 +1193,7 @@ extern std::atomic<uint64_t> rocksdb_partial_index_rows_materialized;
 extern bool rocksdb_enable_tmp_table;
 extern bool rocksdb_enable_delete_range_for_drop_index;
 extern bool rocksdb_no_wal;  // [migagent 2026-10-21] no WAL write or sync anywhere
+extern bool rocksdb_index_aligned_sst;  // [migagent 2026-10-22] index-aligned compaction outputs always
 extern bool rocksdb_disable_instant_ddl;
 
 extern unsigned long long rocksdb_converter_record_cached_length;

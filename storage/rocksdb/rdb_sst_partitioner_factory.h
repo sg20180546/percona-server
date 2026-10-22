@@ -207,7 +207,10 @@ class Rdb_sst_partitioner_factory : public rocksdb::SstPartitionerFactory {
 
   std::unique_ptr<rocksdb::SstPartitioner> CreatePartitioner(
       const rocksdb::SstPartitioner::Context &context) const override {
-    if (rdb_migagent_active()) {   // [migagent 2026-10-21] index-aligned outputs at every level (see above)
+    // [migagent 2026-10-21/22] index-aligned outputs at every level (see above): always with
+    // rocksdb_index_aligned_sst, else while the agent runs (compactions that start before
+    // the agent does would otherwise span tenants and make relink abort)
+    if (rocksdb_index_aligned_sst || rdb_migagent_active()) {
       return std::unique_ptr<rocksdb::SstPartitioner>(
           new Rdb_index_change_sst_partitioner());
     }

@@ -774,6 +774,9 @@ bool rocksdb_enable_tmp_table = false;
 bool rocksdb_enable_delete_range_for_drop_index = false;
 // [migagent 2026-10-21] rocksdb_no_wal: no WAL write or sync anywhere (see the sysvar below)
 bool rocksdb_no_wal = false;
+// [migagent 2026-10-22] rocksdb_index_aligned_sst: cut every compaction output at index-id
+// boundaries from the first compaction on, not only while the agent runs (see the sysvar below)
+bool rocksdb_index_aligned_sst = false;
 unsigned long long rocksdb_converter_record_cached_length = 0;
 
 static std::atomic<uint64_t> rocksdb_row_lock_deadlocks(0);
@@ -2556,6 +2559,20 @@ static MYSQL_SYSVAR_BOOL(enable_delete_range_for_drop_index,
 // the HDFS write pipeline broke (a stalled, swapping destination; a slow
 // DataNode). Durability = memtable flush at a clean shutdown, the same as
 // serverclient's disableWAL. Read-only: set in my.cnf.
+// [migagent 2026-10-22] Index-aligned compaction outputs ALWAYS. The partitioner that
+// Rdb_sst_partitioner_factory returns while the migration agent runs (847f6c8) left a
+// hole: compactions that start between DB::Open and the agent's start -- the L0 files
+// of the previous shutdown's flush are often enough to trigger one -- use the stock
+// bulk-load partitioner and produce one file spanning many tenants; relink then aborts
+// with "straddling L1+ file" (lock-OMG cell 2026-10-22 00:31 MST, all three tenants).
+// ON = cut at every index id in every compaction regardless of the agent. Read-only.
+static MYSQL_SYSVAR_BOOL(index_aligned_sst, rocksdb_index_aligned_sst,
+                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                         "Cut every compaction output file at index-id "
+                         "boundaries (a file never holds two indexes); the "
+                         "migration agent enables the same cut while it runs",
+                         nullptr, nullptr, false);
+
 static MYSQL_SYSVAR_BOOL(no_wal, rocksdb_no_wal,
                          PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
                          "Never write or sync the RocksDB WAL (all writes "
@@ -2702,6 +2719,7 @@ static struct SYS_VAR *rocksdb_system_variables[] = {
     MYSQL_SYSVAR(write_disable_wal),
     MYSQL_SYSVAR(write_disable_wal_save),
     MYSQL_SYSVAR(no_wal),
+    MYSQL_SYSVAR(index_aligned_sst),
     MYSQL_SYSVAR(write_ignore_missing_column_families),
     MYSQL_SYSVAR(protection_bytes_per_key),
 
