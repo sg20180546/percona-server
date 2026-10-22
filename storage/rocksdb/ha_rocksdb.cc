@@ -772,6 +772,8 @@ bool rocksdb_disable_instant_ddl = false;
 bool rocksdb_column_default_value_as_expression = true;
 bool rocksdb_enable_tmp_table = false;
 bool rocksdb_enable_delete_range_for_drop_index = false;
+// [migagent 2026-10-21] rocksdb_no_wal: no WAL write or sync anywhere (see the sysvar below)
+bool rocksdb_no_wal = false;
 unsigned long long rocksdb_converter_record_cached_length = 0;
 
 static std::atomic<uint64_t> rocksdb_row_lock_deadlocks(0);
@@ -2545,6 +2547,22 @@ static MYSQL_SYSVAR_BOOL(enable_delete_range_for_drop_index,
                          "Enable drop table/index by delete range", nullptr,
                          nullptr, false);
 
+// [migagent 2026-10-21] Never write or sync the WAL: transactions, the data
+// dictionary and the drop-index range deletes all write with disableWAL, and
+// the background thread does not FlushWAL. Why: with the WAL on disaggregated
+// storage (HDFS, replication 1) the per-second FlushWAL(sync) of an otherwise
+// empty WAL stream -- rocksdb_write_disable_wal=ON already kept data out of it
+// -- aborted mysqld ("WAL Sync error ... aborting on BG write error") whenever
+// the HDFS write pipeline broke (a stalled, swapping destination; a slow
+// DataNode). Durability = memtable flush at a clean shutdown, the same as
+// serverclient's disableWAL. Read-only: set in my.cnf.
+static MYSQL_SYSVAR_BOOL(no_wal, rocksdb_no_wal,
+                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                         "Never write or sync the RocksDB WAL (all writes "
+                         "disableWAL, no background FlushWAL); durability "
+                         "only through memtable flush at a clean shutdown",
+                         nullptr, nullptr, false);
+
 static MYSQL_SYSVAR_BOOL(alter_table_comment_inplace,
                          rocksdb_alter_table_comment_inplace,
                          PLUGIN_VAR_RQCMDARG,
@@ -2683,6 +2701,7 @@ static struct SYS_VAR *rocksdb_system_variables[] = {
     MYSQL_SYSVAR(flush_log_at_trx_commit),
     MYSQL_SYSVAR(write_disable_wal),
     MYSQL_SYSVAR(write_disable_wal_save),
+    MYSQL_SYSVAR(no_wal),
     MYSQL_SYSVAR(write_ignore_missing_column_families),
     MYSQL_SYSVAR(protection_bytes_per_key),
 
@@ -4511,9 +4530,9 @@ class Rdb_transaction_impl : public Rdb_transaction {
     write_opts.protection_bytes_per_key =
         THDVAR(m_thd, protection_bytes_per_key);
     write_opts.sync = (rocksdb_flush_log_at_trx_commit == FLUSH_LOG_SYNC) &&
-                      rdb_sync_wal_supported();
+                      rdb_sync_wal_supported() && !rocksdb_no_wal;
     fix_write_disable_wal_value(m_thd, write_opts.sync);
-    write_opts.disableWAL = THDVAR(m_thd, write_disable_wal);
+    write_opts.disableWAL = THDVAR(m_thd, write_disable_wal) || rocksdb_no_wal;
     write_opts.ignore_missing_column_families =
         THDVAR(m_thd, write_ignore_missing_column_families);
 
@@ -4804,10 +4823,10 @@ class Rdb_writebatch_impl : public Rdb_transaction {
   void start_tx() override {
     reset();
     write_opts.sync = (rocksdb_flush_log_at_trx_commit == FLUSH_LOG_SYNC) &&
-                      rdb_sync_wal_supported();
+                      rdb_sync_wal_supported() && !rocksdb_no_wal;
 
     fix_write_disable_wal_value(m_thd, write_opts.sync);
-    write_opts.disableWAL = THDVAR(m_thd, write_disable_wal);
+    write_opts.disableWAL = THDVAR(m_thd, write_disable_wal) || rocksdb_no_wal;
     write_opts.ignore_missing_column_families =
         THDVAR(m_thd, write_ignore_missing_column_families);
     write_opts.protection_bytes_per_key =
@@ -5068,6 +5087,7 @@ static bool rocksdb_flush_wal(handlerton *const hton MY_ATTRIBUTE((__unused__)),
                               bool binlog_group_flush) {
   DBUG_ENTER("rocksdb_flush_wal");
   assert(rdb != nullptr);
+  if (rocksdb_no_wal) DBUG_RETURN(false);   // [migagent 2026-10-21] nothing is ever written to the WAL
 
   /**
     If !binlog_group_flush, we got invoked by FLUSH LOGS or similar.
@@ -12395,11 +12415,12 @@ static int delete_range(const std::unordered_set<GL_INDEX_ID> &indices) {
   rocksdb::TransactionDBWriteOptimizations optimize;
   optimize.skip_concurrency_control = true;
   optimize.skip_duplicate_key_check = true;
-  rocksdb::Status status =
-      rdb->Write(rocksdb::WriteOptions(), optimize, &batch);
+  rocksdb::WriteOptions range_wo;
+  range_wo.disableWAL = rocksdb_no_wal;   // [migagent 2026-10-21]
+  rocksdb::Status status = rdb->Write(range_wo, optimize, &batch);
 
   if (status.ok()) {
-    if (!rdb_sync_wal_supported()) {
+    if (!rdb_sync_wal_supported() && !rocksdb_no_wal) {
       // If we don't support SyncWAL, do a flush at least
       rdb->FlushWAL(false);
     }
@@ -15176,7 +15197,9 @@ void Rdb_background_thread::run() {
     // InnoDB's behavior. For mode never, the wal file isn't even written,
     // whereas background writes to the wal file, but issues the syncs in a
     // background thread.
-    if (rdb && (rocksdb_flush_log_at_trx_commit != FLUSH_LOG_SYNC) &&
+    // [migagent 2026-10-21] rocksdb_no_wal: nothing is in the WAL, no sync.
+    if (rdb && !rocksdb_no_wal &&
+        (rocksdb_flush_log_at_trx_commit != FLUSH_LOG_SYNC) &&
         !rocksdb_db_options->allow_mmap_writes) {
       bool sync = rdb_sync_wal_supported();
       const rocksdb::Status s = rdb->FlushWAL(sync);
