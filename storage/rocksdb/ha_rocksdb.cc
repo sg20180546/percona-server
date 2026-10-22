@@ -4288,6 +4288,12 @@ class Rdb_transaction_impl : public Rdb_transaction {
       return false;
     }
 
+    // [migagent 2026-10-21] rocksdb_no_wal: a two-phase prepare is a WAL-only
+    // write (RocksDB forces disableWAL=false for it) and it ran for every
+    // statement that touches RocksDB together with InnoDB's data dictionary
+    // (ANALYZE TABLE: 49 WAL bytes each). With no WAL there is nothing to
+    // prepare: the commit is one disableWAL write (CommitWithoutPrepare).
+    if (rocksdb_no_wal) return true;
     s = m_rocksdb_tx->Prepare();
     if (!s.ok()) {
       std::string msg = "RocksDB error on COMMIT (Prepare): " + s.ToString();
