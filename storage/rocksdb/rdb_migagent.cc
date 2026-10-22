@@ -164,7 +164,7 @@ void on_pause_hook(void *, const char *lo, size_t lo_len, const char *hi, size_t
   if (f == nullptr) { g_fences.push_back(Fence{l, h}); f = &g_fences.back(); }
   f->state = FENCE_EXPORTING;
   g_fence_n.store(static_cast<int>(g_fences.size()), std::memory_order_release);
-  host_log(0, "write fence " + fence_name(*f) + " raised (export start; in-flight commits drained in " +
+  host_log(1, "write fence " + fence_name(*f) + " raised (export start; in-flight commits drained in " +
                   std::to_string(waited) + " ms)");
 }
 
@@ -175,7 +175,7 @@ void on_resume_hook(void *) {
     if (f.state == FENCE_EXPORTING) {
       f.state = FENCE_RESUMED;
       f.resumed_ms = now;
-      host_log(0, "write fence " + fence_name(f) + " kept after resume, waiting for the drop (refused " +
+      host_log(1, "write fence " + fence_name(f) + " kept after resume, waiting for the drop (refused " +
                       std::to_string(f.refused) + " so far)");
     }
   }
@@ -190,13 +190,13 @@ void on_ownership_hook(void *, const char *lo, size_t lo_len, const char *hi, si
     Fence *f = fence_find_locked(l, h);
     if (f == nullptr) { g_fences.push_back(Fence{l, h}); f = &g_fences.back(); }
     f->state = FENCE_MOVED;
-    host_log(0, "write fence " + fence_name(*f) + " permanent: range dropped (moved away; refused " +
+    host_log(1, "write fence " + fence_name(*f) + " permanent: range dropped (moved away; refused " +
                     std::to_string(f->refused) + " so far)");
   } else {
     std::vector<Fence> keep;
     for (const Fence &f : g_fences) {
       if (f.hi <= l || h <= f.lo) keep.push_back(f);   // no overlap with the range owned again
-      else host_log(0, "write fence " + fence_name(f) + " lifted: range owned here");
+      else host_log(1, "write fence " + fence_name(f) + " lifted: range owned here");
     }
     g_fences.swap(keep);
   }
@@ -395,7 +395,7 @@ bool Rdb_migagent_commit_gate::refused(const rocksdb::WriteBatch &wb) {
   // under the shared lock: a relaxed per-fence counter is enough (only logged)
   const uint64_t n = __atomic_add_fetch(&chk.hit->refused, 1, __ATOMIC_RELAXED);
   if (n <= 3 || (n & (n - 1)) == 0)
-    host_log(0, "write fence " + fence_name(*chk.hit) + " refused a commit (" + std::to_string(n) +
+    host_log(1, "write fence " + fence_name(*chk.hit) + " refused a commit (" + std::to_string(n) +
                     " so far): ER_LOCK_DEADLOCK, the client retries at the new owner");
   return true;
 }
