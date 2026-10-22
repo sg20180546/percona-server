@@ -18,9 +18,11 @@ $CXX -std=c++17 -Wall -Wextra -fPIC -I"$INC" -c "$DIR/rdb_migagent.cc" -o "$OUT/
 echo "[2] stub libmigagent.so"
 $CXX -std=c++17 -Wall -fPIC -shared "$DIR/rdb_migagent_stub.cc" -o "$OUT/libmigagent_stub.so"
 echo "[3] test"
-$CXX -std=c++17 -Wall -pthread -I"$INC" "$DIR/rdb_migagent_test.cc" "$OUT/rdb_migagent.o" -L"$LIBDIR" \
-  -Wl,-rpath,"$LIBDIR" -lrocksdb -ldl -o "$OUT/rdb_migagent_test"
 HADOOP_HOME=${HADOOP_HOME:-/data/sungjin/hadoop-3.3.1}
 JAVA_HOME=${JAVA_HOME:-/data/sungjin/jdk-11.0.24+8}
+# rpath-link: the linker must resolve librocksdb's own NEEDED (libhdfs -> libjvm) of a WITH_HDFS build
+$CXX -std=c++17 -Wall -pthread -I"$INC" "$DIR/rdb_migagent_test.cc" "$OUT/rdb_migagent.o" -L"$LIBDIR" \
+  -Wl,-rpath,"$LIBDIR" -Wl,-rpath-link,"$HADOOP_HOME/lib/native:$JAVA_HOME/lib/server" -lrocksdb -ldl \
+  -o "$OUT/rdb_migagent_test"
 LD_LIBRARY_PATH="$HADOOP_HOME/lib/native:$JAVA_HOME/lib/server:$LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
   "$OUT/rdb_migagent_test" "$OUT/libmigagent_stub.so"
