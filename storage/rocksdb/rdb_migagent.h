@@ -32,6 +32,10 @@
 /* RocksDB includes */
 #include "rocksdb/slice.h"
 
+namespace rocksdb {
+class WriteBatch;
+}
+
 namespace myrocks {
 
 struct Rdb_migagent_params {
@@ -64,5 +68,35 @@ bool rdb_migagent_should_drop(const rocksdb::Slice &key);
 
 // The loaded library's migagent_version() string, "" when not running.
 const char *rdb_migagent_version();
+
+// [migagent fence 2026-10-21] Commit-time write fence (CAB with Q23=commit; MIGAGENT.md section 6, "must implement before
+// any write workload"). The agent does not see SQL, so the fence lives here and the agent only reports its state through
+// the ABI hooks that were unused until now:
+//   on_pause(lo, hi)        the SOURCE starts exporting [lo, hi) -- called at the start of OP_MIG_EXPORT, before the
+//                           memtable flush / iteration / file listing (OP_PAUSE itself carries no range and is ignored)
+//   on_resume()             the coordinator resumed: an exporting range waits up to 30 s (env MIGAGENT_FENCE_GRACE_MS)
+//                           for its drop; no drop = the move was aborted, the fence lapses
+//   on_ownership(lo,hi,0)   the source dropped [lo, hi): fenced for good (until owned again or the process restarts)
+//   on_ownership(lo,hi,1)   [lo, hi) is owned here (again): any fence on it is lifted
+// A commit whose write batch touches a fenced range of the data CF (column family id 0) is refused: the caller rolls the
+// transaction back and reports ER_LOCK_DEADLOCK (1213, "try restarting transaction"), so the client retries it at the new
+// owner. Atomicity: a commit holds the gate's SHARED side across the engine commit; raising a fence takes the EXCLUSIVE
+// side, so every commit that passed the check is in the memtable before the export flushes or reads it, and no later
+// commit can reach the range. Ranges compare like the agent's: the key's first 8 bytes, zero padded, bytewise.
+// The gate lock prefers writers (glibc), so a raise waits only for the commits already inside. Fences live in the
+// process: (re)starting the agent clears them, and with the agent off the gate takes no lock and checks nothing
+// (bit-identical to stock MyRocks).
+class Rdb_migagent_commit_gate {
+ public:
+  Rdb_migagent_commit_gate();
+  ~Rdb_migagent_commit_gate();
+  Rdb_migagent_commit_gate(const Rdb_migagent_commit_gate &) = delete;
+  Rdb_migagent_commit_gate &operator=(const Rdb_migagent_commit_gate &) = delete;
+  // true = the batch writes a fenced range: the caller must roll back and report ER_LOCK_DEADLOCK
+  bool refused(const rocksdb::WriteBatch &wb);
+
+ private:
+  bool m_locked = false;
+};
 
 }  // namespace myrocks

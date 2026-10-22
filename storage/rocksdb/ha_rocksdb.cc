@@ -4281,6 +4281,13 @@ class Rdb_transaction_impl : public Rdb_transaction {
   bool commit_no_binlog() override {
     bool res = false;
     rocksdb::Status s;
+    // [migagent fence 2026-10-21] held across the engine commit; refuses a batch that writes a range being moved away
+    Rdb_migagent_commit_gate migagent_gate;
+    if (migagent_gate.refused(*m_rocksdb_tx->GetWriteBatch()->GetWriteBatch())) {
+      my_error(ER_LOCK_DEADLOCK, MYF(0));
+      rollback();
+      return true;
+    }
 
     s = merge_auto_incr_map(m_rocksdb_tx->GetWriteBatch()->GetWriteBatch());
 #ifndef NDEBUG
@@ -4645,6 +4652,13 @@ class Rdb_writebatch_impl : public Rdb_transaction {
     rocksdb::Status s;
     rocksdb::TransactionDBWriteOptimizations optimize;
     optimize.skip_concurrency_control = true;
+    // [migagent fence 2026-10-21] as in Rdb_transaction_impl::commit_no_binlog
+    Rdb_migagent_commit_gate migagent_gate;
+    if (migagent_gate.refused(*m_batch->GetWriteBatch())) {
+      my_error(ER_LOCK_DEADLOCK, MYF(0));
+      rollback();
+      return true;
+    }
 
     s = merge_auto_incr_map(m_batch->GetWriteBatch());
     if (!s.ok()) {
