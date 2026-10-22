@@ -30,6 +30,7 @@
 /* MyRocks includes */
 #include "./ha_rocksdb_proto.h"
 #include "./rdb_datadic.h"
+#include "./rdb_migagent.h"  // [migagent 2026-10-20] per-key ownership decision
 
 namespace myrocks {
 
@@ -58,6 +59,18 @@ class Rdb_compact_filter : public rocksdb::CompactionFilter {
     gl_index_id.cf_id = m_cf_id;
     gl_index_id.index_id = rdb_netbuf_to_uint32((const uchar *)key.data());
     assert(gl_index_id.index_id >= 1);
+
+    // [migagent 2026-10-20] keys of a range this node no longer owns (moved
+    // away by a shard migration) and does not retain (not PREPAREd incoming)
+    // are dropped by compaction, as the KV server's OwnershipFilter does.
+    // Only the data CF ("default", cf id 0) is asked; "__system__" (cf id != 0,
+    // the data dictionary) is never migrated and never asked. When the agent
+    // is not running rdb_migagent_should_drop is one acquire load == false.
+    if (m_cf_id == 0 /* default = data CF */ &&
+        rdb_migagent_should_drop(key)) {
+      m_num_deleted++;
+      return true;
+    }
 
     if (gl_index_id != m_prev_index) {
       m_should_delete = rdb_get_dict_manager()

@@ -19,6 +19,7 @@
 #include <strings.h>
 #include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <utility>
@@ -27,6 +28,7 @@
 
 #include "./rdb_cf_manager.h"
 #include "./rdb_datadic.h"
+#include "./rdb_migagent.h"
 
 namespace myrocks {
 /**
@@ -151,6 +153,33 @@ class Rdb_index_boundary_sst_partitioner : public rocksdb::SstPartitioner {
  * creates sst partitioner used in compaction.
  * see comments in Rdb_index_boundary_sst_partitioner.
  */
+// [migagent 2026-10-21] Cuts a compaction output wherever the index id (the key's first INDEX_NUMBER_SIZE bytes) changes,
+// at every output level, so no L1+ file holds two indexes and therefore never two tenants (a tenant is a contiguous run
+// of index ids). Used while the migration agent runs: relink (OMG / lock-OMG) hands off whole L1+ files and aborts on a
+// file that straddles the moved range. RocksDB does not apply partitioners to flushes; the agent copy-extracts
+// straddling L0 files. Subsumes the bulk-load boundaries below (every index boundary is cut).
+class Rdb_index_change_sst_partitioner : public rocksdb::SstPartitioner {
+ public:
+  const char *Name() const override { return "Rdb_index_change_sst_partitioner"; }
+  rocksdb::PartitionerResult ShouldPartition(
+      const rocksdb::PartitionerRequest &request) override {
+    return same_index(*request.prev_user_key, *request.current_user_key)
+               ? rocksdb::PartitionerResult::kNotRequired
+               : rocksdb::PartitionerResult::kRequired;
+  }
+  bool CanDoTrivialMove(const rocksdb::Slice &smallest_user_key,
+                        const rocksdb::Slice &largest_user_key) override {
+    return same_index(smallest_user_key, largest_user_key);
+  }
+
+ private:
+  static bool same_index(const rocksdb::Slice &a, const rocksdb::Slice &b) {
+    const size_t n = Rdb_key_def::INDEX_NUMBER_SIZE;
+    const size_t la = std::min(a.size(), n), lb = std::min(b.size(), n);
+    return la == lb && memcmp(a.data(), b.data(), la) == 0;
+  }
+};
+
 class Rdb_sst_partitioner_factory : public rocksdb::SstPartitionerFactory {
   const rocksdb::Comparator *m_comparator;
   const int m_num_levels;
@@ -178,6 +207,13 @@ class Rdb_sst_partitioner_factory : public rocksdb::SstPartitionerFactory {
 
   std::unique_ptr<rocksdb::SstPartitioner> CreatePartitioner(
       const rocksdb::SstPartitioner::Context &context) const override {
+    // [migagent 2026-10-21/22] index-aligned outputs at every level (see above): always with
+    // rocksdb_index_aligned_sst, else while the agent runs (compactions that start before
+    // the agent does would otherwise span tenants and make relink abort)
+    if (rocksdb_index_aligned_sst || rdb_migagent_active()) {
+      return std::unique_ptr<rocksdb::SstPartitioner>(
+          new Rdb_index_change_sst_partitioner());
+    }
     // we need special partitioner for Lmax.
     // when rocksdb checks if SstPartitioner is used in a manual compaction,
     // it passes -1 as output_level to indicate output_level is not yet known.

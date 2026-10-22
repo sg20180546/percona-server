@@ -89,6 +89,7 @@
 #include "./rdb_cf_manager.h"
 #include "./rdb_cf_options.h"
 #include "./rdb_converter.h"
+#include "./rdb_migagent.h"  // [migagent 2026-10-20] in-process migration agent (libmigagent.so)
 #include "./rdb_datadic.h"
 #include "./rdb_i_s.h"
 #include "./rdb_index_merge.h"
@@ -771,6 +772,11 @@ bool rocksdb_disable_instant_ddl = false;
 bool rocksdb_column_default_value_as_expression = true;
 bool rocksdb_enable_tmp_table = false;
 bool rocksdb_enable_delete_range_for_drop_index = false;
+// [migagent 2026-10-21] rocksdb_no_wal: no WAL write or sync anywhere (see the sysvar below)
+bool rocksdb_no_wal = false;
+// [migagent 2026-10-22] rocksdb_index_aligned_sst: cut every compaction output at index-id
+// boundaries from the first compaction on, not only while the agent runs (see the sysvar below)
+bool rocksdb_index_aligned_sst = false;
 unsigned long long rocksdb_converter_record_cached_length = 0;
 
 static std::atomic<uint64_t> rocksdb_row_lock_deadlocks(0);
@@ -2318,6 +2324,50 @@ static MYSQL_SYSVAR_STR(fs_uri, rocksdb_fs_uri,
                         PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_READONLY,
                         "Custom filesystem URI", nullptr, nullptr, nullptr);
 
+// [migagent 2026-10-20] In-process shard-migration agent (rdb_migagent.cc):
+// mysqld dlopen()s libmigagent.so after the DB is open and the agent serves
+// the migration coordinator's wire protocol on migagent_addr:migagent_port.
+// Everything is off (nothing loaded, no listener, compaction filter untouched)
+// unless rocksdb_migagent_port > 0.
+static unsigned int rocksdb_migagent_port = 0;
+static char *rocksdb_migagent_lib = nullptr;
+static char *rocksdb_migagent_addr = nullptr;
+static unsigned int rocksdb_migagent_shard_id = 0;
+static char *rocksdb_migagent_log = nullptr;
+
+static MYSQL_SYSVAR_UINT(migagent_port, rocksdb_migagent_port,
+                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                         "Port of the in-process migration agent (0 = disabled)",
+                         nullptr, nullptr, 0, 0, 65535, 0);
+
+static MYSQL_SYSVAR_STR(migagent_lib, rocksdb_migagent_lib,
+                        PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                        "Path of libmigagent.so", nullptr, nullptr, "");
+
+static MYSQL_SYSVAR_STR(migagent_addr, rocksdb_migagent_addr,
+                        PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                        "Listen address of the migration agent", nullptr,
+                        nullptr, "0.0.0.0");
+
+static MYSQL_SYSVAR_UINT(migagent_shard_id, rocksdb_migagent_shard_id,
+                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                         "Logical shard id of this node as the migration "
+                         "coordinator numbers it",
+                         nullptr, nullptr, 0, 0, 65535, 0);
+
+static MYSQL_SYSVAR_STR(migagent_log, rocksdb_migagent_log,
+                        PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                        "Agent log file (empty = mysqld error log)", nullptr,
+                        nullptr, "");
+
+// [migagent 2026-10-20] host logger handed to the agent: its 0/1/2 levels onto
+// the plugin error log.
+static void rdb_migagent_log_cb(int level, const char *msg) {
+  LogPluginErrMsg(level >= 2 ? ERROR_LEVEL
+                             : (level == 1 ? WARNING_LEVEL : INFORMATION_LEVEL),
+                  0, "%s", msg);   // the agent's and the glue's lines carry their own [migagent] tag
+}
+
 static MYSQL_SYSVAR_UINT(
     table_stats_sampling_pct, rocksdb_table_stats_sampling_pct,
     PLUGIN_VAR_RQCMDARG,
@@ -2500,6 +2550,36 @@ static MYSQL_SYSVAR_BOOL(enable_delete_range_for_drop_index,
                          "Enable drop table/index by delete range", nullptr,
                          nullptr, false);
 
+// [migagent 2026-10-21] Never write or sync the WAL: transactions, the data
+// dictionary and the drop-index range deletes all write with disableWAL, and
+// the background thread does not FlushWAL. Why: with the WAL on disaggregated
+// storage (HDFS, replication 1) the per-second FlushWAL(sync) of an otherwise
+// empty WAL stream -- rocksdb_write_disable_wal=ON already kept data out of it
+// -- aborted mysqld ("WAL Sync error ... aborting on BG write error") whenever
+// the HDFS write pipeline broke (a stalled, swapping destination; a slow
+// DataNode). Durability = memtable flush at a clean shutdown, the same as
+// serverclient's disableWAL. Read-only: set in my.cnf.
+// [migagent 2026-10-22] Index-aligned compaction outputs ALWAYS. The partitioner that
+// Rdb_sst_partitioner_factory returns while the migration agent runs (847f6c8) left a
+// hole: compactions that start between DB::Open and the agent's start -- the L0 files
+// of the previous shutdown's flush are often enough to trigger one -- use the stock
+// bulk-load partitioner and produce one file spanning many tenants; relink then aborts
+// with "straddling L1+ file" (lock-OMG cell 2026-10-22 00:31 MST, all three tenants).
+// ON = cut at every index id in every compaction regardless of the agent. Read-only.
+static MYSQL_SYSVAR_BOOL(index_aligned_sst, rocksdb_index_aligned_sst,
+                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                         "Cut every compaction output file at index-id "
+                         "boundaries (a file never holds two indexes); the "
+                         "migration agent enables the same cut while it runs",
+                         nullptr, nullptr, false);
+
+static MYSQL_SYSVAR_BOOL(no_wal, rocksdb_no_wal,
+                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                         "Never write or sync the RocksDB WAL (all writes "
+                         "disableWAL, no background FlushWAL); durability "
+                         "only through memtable flush at a clean shutdown",
+                         nullptr, nullptr, false);
+
 static MYSQL_SYSVAR_BOOL(alter_table_comment_inplace,
                          rocksdb_alter_table_comment_inplace,
                          PLUGIN_VAR_RQCMDARG,
@@ -2638,6 +2718,8 @@ static struct SYS_VAR *rocksdb_system_variables[] = {
     MYSQL_SYSVAR(flush_log_at_trx_commit),
     MYSQL_SYSVAR(write_disable_wal),
     MYSQL_SYSVAR(write_disable_wal_save),
+    MYSQL_SYSVAR(no_wal),
+    MYSQL_SYSVAR(index_aligned_sst),
     MYSQL_SYSVAR(write_ignore_missing_column_families),
     MYSQL_SYSVAR(protection_bytes_per_key),
 
@@ -2679,6 +2761,11 @@ static struct SYS_VAR *rocksdb_system_variables[] = {
     MYSQL_SYSVAR(print_snapshot_conflict_queries),
 
     MYSQL_SYSVAR(datadir),
+    MYSQL_SYSVAR(migagent_port),  // [migagent 2026-10-20]
+    MYSQL_SYSVAR(migagent_lib),
+    MYSQL_SYSVAR(migagent_addr),
+    MYSQL_SYSVAR(migagent_shard_id),
+    MYSQL_SYSVAR(migagent_log),
     MYSQL_SYSVAR(fs_uri),
     MYSQL_SYSVAR(create_checkpoint),
     MYSQL_SYSVAR(create_temporary_checkpoint),
@@ -4219,6 +4306,12 @@ class Rdb_transaction_impl : public Rdb_transaction {
       return false;
     }
 
+    // [migagent 2026-10-21] rocksdb_no_wal: a two-phase prepare is a WAL-only
+    // write (RocksDB forces disableWAL=false for it) and it ran for every
+    // statement that touches RocksDB together with InnoDB's data dictionary
+    // (ANALYZE TABLE: 49 WAL bytes each). With no WAL there is nothing to
+    // prepare: the commit is one disableWAL write (CommitWithoutPrepare).
+    if (rocksdb_no_wal) return true;
     s = m_rocksdb_tx->Prepare();
     if (!s.ok()) {
       std::string msg = "RocksDB error on COMMIT (Prepare): " + s.ToString();
@@ -4231,6 +4324,13 @@ class Rdb_transaction_impl : public Rdb_transaction {
   bool commit_no_binlog() override {
     bool res = false;
     rocksdb::Status s;
+    // [migagent fence 2026-10-21] held across the engine commit; refuses a batch that writes a range being moved away
+    Rdb_migagent_commit_gate migagent_gate;
+    if (migagent_gate.refused(*m_rocksdb_tx->GetWriteBatch()->GetWriteBatch())) {
+      my_error(ER_LOCK_DEADLOCK, MYF(0));
+      rollback();
+      return true;
+    }
 
     s = merge_auto_incr_map(m_rocksdb_tx->GetWriteBatch()->GetWriteBatch());
 #ifndef NDEBUG
@@ -4454,9 +4554,9 @@ class Rdb_transaction_impl : public Rdb_transaction {
     write_opts.protection_bytes_per_key =
         THDVAR(m_thd, protection_bytes_per_key);
     write_opts.sync = (rocksdb_flush_log_at_trx_commit == FLUSH_LOG_SYNC) &&
-                      rdb_sync_wal_supported();
+                      rdb_sync_wal_supported() && !rocksdb_no_wal;
     fix_write_disable_wal_value(m_thd, write_opts.sync);
-    write_opts.disableWAL = THDVAR(m_thd, write_disable_wal);
+    write_opts.disableWAL = THDVAR(m_thd, write_disable_wal) || rocksdb_no_wal;
     write_opts.ignore_missing_column_families =
         THDVAR(m_thd, write_ignore_missing_column_families);
 
@@ -4595,6 +4695,13 @@ class Rdb_writebatch_impl : public Rdb_transaction {
     rocksdb::Status s;
     rocksdb::TransactionDBWriteOptimizations optimize;
     optimize.skip_concurrency_control = true;
+    // [migagent fence 2026-10-21] as in Rdb_transaction_impl::commit_no_binlog
+    Rdb_migagent_commit_gate migagent_gate;
+    if (migagent_gate.refused(*m_batch->GetWriteBatch())) {
+      my_error(ER_LOCK_DEADLOCK, MYF(0));
+      rollback();
+      return true;
+    }
 
     s = merge_auto_incr_map(m_batch->GetWriteBatch());
     if (!s.ok()) {
@@ -4740,10 +4847,10 @@ class Rdb_writebatch_impl : public Rdb_transaction {
   void start_tx() override {
     reset();
     write_opts.sync = (rocksdb_flush_log_at_trx_commit == FLUSH_LOG_SYNC) &&
-                      rdb_sync_wal_supported();
+                      rdb_sync_wal_supported() && !rocksdb_no_wal;
 
     fix_write_disable_wal_value(m_thd, write_opts.sync);
-    write_opts.disableWAL = THDVAR(m_thd, write_disable_wal);
+    write_opts.disableWAL = THDVAR(m_thd, write_disable_wal) || rocksdb_no_wal;
     write_opts.ignore_missing_column_families =
         THDVAR(m_thd, write_ignore_missing_column_families);
     write_opts.protection_bytes_per_key =
@@ -5004,6 +5111,7 @@ static bool rocksdb_flush_wal(handlerton *const hton MY_ATTRIBUTE((__unused__)),
                               bool binlog_group_flush) {
   DBUG_ENTER("rocksdb_flush_wal");
   assert(rdb != nullptr);
+  if (rocksdb_no_wal) DBUG_RETURN(false);   // [migagent 2026-10-21] nothing is ever written to the WAL
 
   /**
     If !binlog_group_flush, we got invoked by FLUSH LOGS or similar.
@@ -6789,6 +6897,30 @@ static int rocksdb_init_internal(void *const p) {
   rocksdb_set_max_bottom_pri_background_compactions_internal(
       rocksdb_max_bottom_pri_background_compactions);
 
+  // [migagent 2026-10-20] in-process migration agent (rocksdb_migagent_port >
+  // 0): dlopen libmigagent.so and start it with the open TransactionDB and the
+  // default (data) column family; "__system__" is never handed over. A start
+  // failure fails the plugin init so a misconfigured CN never serves without
+  // its agent. Port 0 (default): rdb_migagent_start is a no-op returning true.
+  {
+    const Rdb_migagent_params migagent_params = {
+        static_cast<rocksdb::DB *>(rdb), rdb->DefaultColumnFamily(),
+        rocksdb_datadir,                 rocksdb_migagent_port,
+        rocksdb_migagent_lib,            rocksdb_migagent_addr,
+        rocksdb_migagent_shard_id,       rocksdb_migagent_log,
+        &rdb_migagent_log_cb};
+    if (!rdb_migagent_start(migagent_params)) {
+      LogPluginErrMsg(ERROR_LEVEL, 0, "migration agent failed to start");
+      DBUG_RETURN(HA_EXIT_FAILURE);
+    }
+    if (rocksdb_migagent_port > 0) {
+      LogPluginErrMsg(INFORMATION_LEVEL, 0,
+                      "migration agent %s listening on %s:%u (shard %u)",
+                      rdb_migagent_version(), rocksdb_migagent_addr,
+                      rocksdb_migagent_port, rocksdb_migagent_shard_id);
+    }
+  }
+
   DBUG_EXECUTE_IF("rocksdb_init_failure_everything_initialized",
                   { DBUG_RETURN(HA_EXIT_FAILURE); });
 
@@ -6811,6 +6943,10 @@ static int rocksdb_shutdown(bool minimalShutdown) {
   Rdb_hton_init_state::Scoped_lock state_lock(*rdb_get_hton_init_state(), true);
 
   if (!minimalShutdown) {
+    // [migagent 2026-10-20] stop the migration agent FIRST: its listener and
+    // in-flight migrations hold the DB, which everything below tears down.
+    rdb_migagent_stop();
+
     // signal the drop index thread to stop
     rdb_drop_idx_thread.signal(true);
 
@@ -12303,11 +12439,12 @@ static int delete_range(const std::unordered_set<GL_INDEX_ID> &indices) {
   rocksdb::TransactionDBWriteOptimizations optimize;
   optimize.skip_concurrency_control = true;
   optimize.skip_duplicate_key_check = true;
-  rocksdb::Status status =
-      rdb->Write(rocksdb::WriteOptions(), optimize, &batch);
+  rocksdb::WriteOptions range_wo;
+  range_wo.disableWAL = rocksdb_no_wal;   // [migagent 2026-10-21]
+  rocksdb::Status status = rdb->Write(range_wo, optimize, &batch);
 
   if (status.ok()) {
-    if (!rdb_sync_wal_supported()) {
+    if (!rdb_sync_wal_supported() && !rocksdb_no_wal) {
       // If we don't support SyncWAL, do a flush at least
       rdb->FlushWAL(false);
     }
@@ -15084,7 +15221,9 @@ void Rdb_background_thread::run() {
     // InnoDB's behavior. For mode never, the wal file isn't even written,
     // whereas background writes to the wal file, but issues the syncs in a
     // background thread.
-    if (rdb && (rocksdb_flush_log_at_trx_commit != FLUSH_LOG_SYNC) &&
+    // [migagent 2026-10-21] rocksdb_no_wal: nothing is in the WAL, no sync.
+    if (rdb && !rocksdb_no_wal &&
+        (rocksdb_flush_log_at_trx_commit != FLUSH_LOG_SYNC) &&
         !rocksdb_db_options->allow_mmap_writes) {
       bool sync = rdb_sync_wal_supported();
       const rocksdb::Status s = rdb->FlushWAL(sync);
